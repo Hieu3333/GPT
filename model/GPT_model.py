@@ -1,21 +1,27 @@
 import math
 import inspect
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+import sys
+import os
 
-    def __init__(self,ndim,bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+# Add the path to the project directory
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from Config.config import GPTConfig
 
-    def forward(self,input):
-        return F.layer_norm(input,self.weight.shape, self.weight, self.bias, 1e-5)
+
+# class LayerNorm(nn.Module):
+#     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+
+#     def __init__(self,ndim,bias):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(ndim))
+#         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+#     def forward(self,input):
+#         return F.layer_norm(input,self.weight.shape, self.weight, self.bias, 1e-5)
     
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
@@ -35,11 +41,11 @@ class CausalSelfAttention(nn.Module):
         #flash_attention but only in torch >= 2.0
         self.flash = hasattr(torch.nn.functional,'scaled_dot_product_attention')
         if not self.flash:
-            print("Flash attention not supported")
+            # print("Flash attention not supported")
             #Use causal mask for slow attention
             self.register_buffer('bias',torch.tril(torch.ones(config.block_size,config.block_size)).view(1,1,config.block_size,config.block_size))
 
-        def forward(self,x):
+    def forward(self,x):
             B,T,C = x.shape 
             # calculate query, key, values for all heads in batch and move head forward to be the batch dim
             q,k,v = self.c_attn(x).split(self.n_embd, dim = 2)
@@ -56,11 +62,12 @@ class CausalSelfAttention(nn.Module):
                 att = F.softmax(att,dim=-1)
                 att = self.attn_dropout(att)
                 out = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+               
             out = out.transpose(1,2).contiguous().view(B,T,C) # re-assemble all head outputs side by side
 
             #output projection
             out = self.resid_dropout(self.c_proj(out))
-            return out
+            return out   
 
 class MLP(nn.Module):
     def __init__(self,config):
@@ -80,25 +87,17 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self,config):
         super().__init__()
-        self.ln1 = LayerNorm(config.n_embd,bias=config.bias)
+        self.ln_1 = nn.LayerNorm(config.n_embd,bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln2 = LayerNorm(config.n_embd, bias = config.bias)
+        self.ln_2 = nn.LayerNorm(config.n_embd, bias = config.bias)
         self.mlp = MLP(config)
 
     def forward(self,x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class GPT(nn.Module):
     def __init__(self,config):
@@ -112,7 +111,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = nn.LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         self.lm_head = nn.Linear(config.n_embd,config.vocab_size, bias = False)
@@ -129,6 +128,31 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def forward(self,idx, targets = None):
+        device = idx.device
+        B,T = idx.shape
+        pos = torch.arange(0,T,dtype = torch.long, device=device)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb+pos_emb)
+
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            logits = self.lm_head(x)
+         
+            loss = F.cross_entropy(logits.view(-1,logits.shape[-1]), targets.view(-1),ignore_index=-1 )
+
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x) # note: using list [-1] to preserve the time dim
+            loss = None
+        return logits, loss
+    
 
     def get_num_params(self,non_embedding = True):
         """
@@ -150,28 +174,6 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight,mean=0.0, std = 0.02)
 
-    def forward(self,idx, targets = None):
-        device = idx.device
-        B,T = idx.shape
-        pos = torch.arange(0,T,dtype = torch.long, device=device)
-
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(idx)
-        x = self.transformer.drop(tok_emb+pos_emb)
-
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1,logits.shape[-1]), targets.view(-1),ignore_index=-1 )
-
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:,[-1],:]) # note: using list [-1] to preserve the time dim
-            loss = None
-        return logits, loss
     
 
     def crop_block_size(self, block_size):
@@ -220,8 +222,7 @@ class GPT(nn.Module):
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model.state_dict()
-
+        sd_hf = model_hf.state_dict()
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('attn.masked_bias')] # ignore these, just a buffer
@@ -294,8 +295,8 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:,-self.config.block_size:]
-            logits, _ = self(idx)
+            idx_cond = idx if idx.size(-1) <= self.config.block_size else idx[:,-self.config.block_size:]
+            logits, _ = self(idx_cond)
             #get the logits and scale by desired temperature
             logits = logits[:,-1,:] / temperature
             # optionally crop the logits to only the top k options
@@ -305,5 +306,15 @@ class GPT(nn.Module):
             probs = F.softmax(logits,dim=-1)
             #sample from distribution
             idx_next = torch.multinomial(probs,num_samples=1)
+            import tiktoken
+            enc = tiktoken.get_encoding('gpt2')
+            if idx_next == enc.eot_token:
+                break
             idx = torch.cat((idx,idx_next), dim=1)
         return idx
+
+
+
+
+
+
