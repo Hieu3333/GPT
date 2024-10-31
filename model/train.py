@@ -36,10 +36,10 @@ torch.set_float32_matmul_precision('high')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Train on:',device)
 
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT.from_pretrained('gpt2')
+# model = GPT(GPTConfig())
 model = model.to(device)
-model = torch.compile(model)
+# model = torch.compile(model)
 optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
 max_iters = 10
 for i in range(max_iters):
@@ -55,7 +55,7 @@ for i in range(max_iters):
     dt = (t1-t0) * 1000 #milliseconds
     tokens_per_sec = (dataloader.B * dataloader.T)/(t1-t0)
     if i%1 == 0:
-        print(f"Iter {i}: loss :{loss.item()} dt:{dt:.2f}s tok/sec:{tokens_per_sec:.2f}")
+        print(f"Iter {i}: loss :{loss.item()} dt:{dt:.2f}ms tok/sec:{tokens_per_sec:.2f}")
     
 
 
